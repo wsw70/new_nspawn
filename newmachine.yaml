@@ -1,0 +1,108 @@
+---
+- hosts: localhost
+  connection: local
+
+  vars:
+    marker: "# ansible {mark} for {{ machine }}"
+    machine_root: /var/lib/machines
+    distro: zesty
+
+  tasks:
+  # checking if all parameters are present
+  - fail: msg="state=[absent|present] missing"
+    when: state is not defined
+  - fail: msg="machine= missing"
+    when: machine is not defined
+
+
+
+############### operations on the container
+
+  # check if the machine is already there
+  - stat: path={{ machine }}
+    register: st
+  - name: check if container exists
+    fail: msg="machine already exists"
+    when: state == 'present' and st.stat.exists == True
+
+  # copy template
+  - name: create machine template
+    command: /bin/cp -pr _ZZ_{{ distro }} {{ machine }}
+    # command: debootstrap --include=nano,dbus,iputils-ping,iproute2 {{ distro }} {{ machine }} http://fr.archive.ubuntu.com/ubuntu
+    when: state == 'present'
+
+  # setting up networking
+  - name: get new IP
+    command: python3 findip.py
+    register: ip
+  - name: set interface
+    blockinfile:
+      dest: "{{ machine }}/etc/network/interfaces"
+      state: "{{ state }}"
+      marker: "{{ marker }}"
+      create: yes
+      force: yes
+      block: |
+        auto host0
+        iface host0 inet static
+          address {{ ip.stdout }}
+          netmask 255.255.255.0
+          gateway 10.200.0.254
+
+  # set hostname
+  - name: set hostname
+    copy:
+      content: "{{ machine }}"
+      force: yes
+      dest: "{{ machine }}/etc/hostname"
+
+############### operations on the system
+
+  # setting up shorewall
+  - name: shorewall rules
+    blockinfile:
+      dest: /etc/shorewall/rules
+      state: "{{ state }}"
+      marker: "{{ marker }}"
+      block: |
+        # setings for machine {{ machine }}
+        # outgoing internet
+        ACCEPT br0:{{ ip.stdout }} int
+        # more here
+  - name: restart shorewall
+    command: shorewall restart
+
+
+  # adding/removing nspawn
+  - block:
+    - name: create container nspawn definition
+      blockinfile:
+          dest: "/etc/systemd/nspawn/{{ machine }}.nspawn"
+          state: "{{ state }}"
+          marker: "{{ marker }}"
+          create: yes
+          block: |
+            [Exec]
+            Boot=yes
+            [Network]
+            Bridge=br0
+            [Service]
+            Restart=always
+    - name: enable container
+      command: systemctl start systemd-nspawn@{{ machine }}.service
+    - command: systemctl enable systemd-nspawn@{{ machine }}.service
+    when: state == 'present'
+  - block:
+    - name: poweroff disable container
+      command: machinectl stop {{ machine }}
+    - command: systemctl disable systemd-nspawn@{{ machine }}.service
+    - name: delete machine template
+      file: path={{ machine_root }}/{{ machine }} state=absent
+    - name: delete container nspawn def
+      file: path=/etc/systemd/nspawn/{{ machine }}.nspawn state=absent
+    when: state == 'absent'
+
+  # delete template if needed
+  - name: create machine template
+    command: rm -fr {{ machine }}
+    when: state == 'absent'
